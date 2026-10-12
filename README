@@ -1,0 +1,46 @@
+# SNCF Travel Tool for Open WebUI
+
+An [Open WebUI](https://openwebui.com) tool that lets an LLM agent plan train trips in France with real data:
+real-time departures/arrivals, A→B itineraries for a whole day, official fare ranges, isochrones
+("where can I go in < 3 h?"), train status with estimated position, disruptions and live Vélib availability.
+
+> Personal, non-commercial, open-source project. Not affiliated with SNCF, Hove/Navitia, Smovengo or the Ville de Paris.
+
+## Functions
+
+| Function | What it answers |
+|---|---|
+| `buscar_estacion` | Station search / ids |
+| `salidas_estacion` / `llegadas_estacion` | Real-time departure / arrival boards (delays, cancellations) |
+| `itinerarios` | All A→B journeys in a time window, with transfers and fare ranges |
+| `rango_precios` | Official full-fare ranges (TGV INOUI, OUIGO, Intercités) |
+| `contar_trenes_dia` | Trains per day at a station, by type and direction |
+| `estado_tren` | Train status by number + estimated position (schedule-based, not GPS) |
+| `destinos_alcanzables` | Isochrone: every station reachable within X hours |
+| `perturbaciones` | Active disruptions (national or per station) |
+| `estaciones_cercanas` | Stations near coordinates |
+| `velib_cerca` | Live Vélib bikes (mechanical / e-bike) and free docks |
+| `cuota_api` | Local request counter vs. SNCF quota |
+
+## Setup
+
+1. Get a free SNCF API token: <https://numerique.sncf.com/startup/api/> (5 000 req/day, 150 000/month).
+2. Open WebUI → Workspace → Tools → **+** → paste `sncf_owui_tool.py` → Save.
+3. Tool settings (Valves) → set `SNCF_API_KEY`.
+4. Enable the tool on a model with native function calling.
+
+## Data sources & attribution
+
+- Timetables / real time: **API SNCF** (powered by [Navitia](https://doc.navitia.io/)).
+- Fares: SNCF open data — *Tarifs TGV INOUI et OUIGO* and *Tarifs Intercités* (ODbL), via data.gouv.fr. Ranges of full fares, not live booking prices; regional TER fares are not published.
+- Vélib: official GBFS feed (Vélib' Métropole / Smovengo), fallback to the Ville de Paris open-data mirror.
+
+## Limitations
+
+- No live booking prices (SNCF does not publish them openly).
+- Train position is estimated from real-time schedules, not GPS.
+- Transilien/RER real time and Paris metro/bus are not covered (planned: PRIM Île-de-France Mobilités).
+
+## License
+
+MIT

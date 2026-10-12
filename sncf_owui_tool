@@ -1,0 +1,1066 @@
+"""
+title: SNCF Trenes en Tiempo Real (API SNCF / Navitia)
+author: Uriel (SOVLAB)
+version: 1.3.1
+license: MIT
+requirements: requests
+description: Consulta la API SNCF (basada en Navitia): búsqueda de estaciones, salidas/llegadas
+             en tiempo real, itinerarios A→B de un día completo (con rangos de precio), trenes directos
+             hacia un destino, conteo de trenes por tipo, estado/posición estimada de un tren por su número,
+             perturbaciones, estaciones cercanas y rangos de precio oficiales (open data SNCF:
+             tarifa plena mín–máx de TGV INOUI, OUIGO e Intercités), isócrona (destinos alcanzables en X h)
+             y disponibilidad Vélib en tiempo real. Cuota API SNCF: 5000 req/día, 150 000 req/mes.
+changelog: 1.1.0 — rango_precios + precios en itinerarios (datasets open data SNCF, sin gastar cuota Navitia)
+           1.2.0 — destinos_alcanzables (isócrona: ¿a dónde llego en X h?) + velib_cerca (GBFS Vélib, sin llave)
+           1.3.0 — fecha OBLIGATORIA en itinerarios/salidas/llegadas/isócrona + eco de fecha recibida;
+                   fechas flexibles ('sábado', '17/10'); User-Agent en todas las peticiones; Vélib con
+                   respaldo Paris Open Data; emparejado de estaciones tolerante ('Hall 1 & 2' vs '1 ET 2')
+           1.3.1 — eco de TODOS los parámetros recibidos (diagnóstico de function calling); hora obligatoria
+                   en la isócrona; aviso si la salida es antes de las 05:00
+"""
+
+import asyncio
+import datetime as dt
+import unicodedata
+from typing import Any, Awaitable, Callable, Optional
+from zoneinfo import ZoneInfo
+
+import requests
+from pydantic import BaseModel, Field
+
+TZ = ZoneInfo("Europe/Paris")
+# Identificarse siempre: algunos servidores (p. ej. Vélib) rechazan el User-Agent por defecto de requests
+USER_AGENT = "SOVLAB-SNCF-OWUI-Tool/1.3.1 (+https://urielpedroza.dev)"
+HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+EmitterT = Optional[Callable[[dict], Awaitable[None]]]
+
+
+# ─────────────────────────────── utilidades ────────────────────────────────
+def _norm(s: str) -> str:
+    """minúsculas sin acentos para comparar texto (TGV INOUI, Intercités, etc.)."""
+    s = unicodedata.normalize("NFKD", s or "")
+    return "".join(c for c in s if not unicodedata.combining(c)).lower().strip()
+
+
+def _parse_nav(s: Optional[str]) -> Optional[dt.datetime]:
+    """'20261012T143000' → datetime local Paris."""
+    if not s:
+        return None
+    try:
+        return dt.datetime.strptime(s, "%Y%m%dT%H%M%S").replace(tzinfo=TZ)
+    except ValueError:
+        return None
+
+
+def _hm(d: Optional[dt.datetime]) -> str:
+    return d.strftime("%H:%M") if d else "??:??"
+
+
+def _to_nav(d: dt.datetime) -> str:
+    return d.strftime("%Y%m%dT%H%M%S")
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now(TZ)
+
+
+def _parse_user_dt(fecha: str = "", hora: str = "") -> dt.datetime:
+    """
+    Acepta fecha 'AAAA-MM-DD', 'DD/MM/AAAA', 'hoy', 'mañana' (o vacío = hoy)
+    y hora 'HH:MM' (o vacío = ahora si es hoy, 00:00 si es otro día).
+    """
+    now = _now()
+    raw = (fecha or "").strip()
+    # 'AAAA-MM-DDTHH:MM' o 'AAAA-MM-DD HH:MM' → separar fecha y hora
+    if ("T" in raw or " " in raw) and raw[:4].isdigit():
+        raw, _, t_part = raw.replace("T", " ").partition(" ")
+        hora = hora or t_part[:5]
+    f = _norm(raw)
+    weekdays = {
+        "lunes": 0, "lundi": 0, "monday": 0, "martes": 1, "mardi": 1, "tuesday": 1,
+        "miercoles": 2, "mercredi": 2, "wednesday": 2, "jueves": 3, "jeudi": 3, "thursday": 3,
+        "viernes": 4, "vendredi": 4, "friday": 4, "sabado": 5, "samedi": 5, "saturday": 5,
+        "domingo": 6, "dimanche": 6, "sunday": 6,
+    }
+    if f in ("", "hoy", "today", "aujourd'hui", "aujourdhui", "ahora", "now"):
+        day = now.date()
+    elif f in ("manana", "tomorrow", "demain"):
+        day = now.date() + dt.timedelta(days=1)
+    elif f in ("pasado manana", "apres-demain", "apres demain", "day after tomorrow"):
+        day = now.date() + dt.timedelta(days=2)
+    elif f.split()[-1] in weekdays:  # 'sábado', 'este sábado', 'samedi' → próxima ocurrencia (hoy incluido)
+        day = now.date() + dt.timedelta(days=(weekdays[f.split()[-1]] - now.weekday()) % 7)
+    else:
+        day = None
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y%m%d", "%d.%m.%Y"):
+            try:
+                day = dt.datetime.strptime(raw, fmt).date()
+                break
+            except ValueError:
+                continue
+        if day is None:  # 'DD/MM' sin año → próxima ocurrencia
+            for fmt in ("%d/%m", "%d-%m", "%d.%m"):
+                try:
+                    d0 = dt.datetime.strptime(raw, fmt).date().replace(year=now.year)
+                    day = d0 if d0 >= now.date() else d0.replace(year=now.year + 1)
+                    break
+                except ValueError:
+                    continue
+        if day is None:
+            raise ValueError(f"Fecha no reconocida: '{fecha}'. Usa AAAA-MM-DD (p. ej. 2026-10-17).")
+    h = (hora or "").strip().lower().replace("h", ":")
+    if h.endswith(":"):
+        h += "00"
+    if h.isdigit():
+        h += ":00"
+    if h:
+        try:
+            t = dt.datetime.strptime(h, "%H:%M").time()
+        except ValueError:
+            raise ValueError(f"Hora no reconocida: '{hora}'. Usa HH:MM.")
+    else:
+        t = now.time() if day == now.date() else dt.time(0, 0)
+    return dt.datetime.combine(day, t).replace(tzinfo=TZ, second=0, microsecond=0)
+
+
+DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+
+
+def _fecha_echo(fecha: str, start: dt.datetime, **otros) -> str:
+    """
+    Línea de control: TODOS los parámetros que recibió la tool y cómo los interpretó. Si el agente cree haber
+    enviado un valor y aquí aparece vacío, el fallo está en la capa de function calling, no en la tool.
+    """
+    extra = "".join(f", {k}={v!r}" for k, v in otros.items())
+    aviso = ""
+    hora_dada = any(str(otros.get(k) or "").strip() for k in ("hora", "desde_hora"))
+    if start.hour < 5 and not hora_dada:
+        aviso = " ⚠️ salida antes de las 05:00: casi no hay trenes; ¿faltó la hora?"
+    return (f"_(parámetros recibidos: fecha={fecha!r}{extra} → {DIAS[start.weekday()]} "
+            f"{start:%d/%m/%Y %H:%M}){aviso}_")
+
+
+def _train_label(di: dict) -> str:
+    """'TGV INOUI 8519' / 'TER 866012' a partir de display_informations."""
+    mode = di.get("commercial_mode") or di.get("physical_mode") or "Train"
+    num = di.get("headsign") or di.get("trip_short_name") or di.get("code") or ""
+    return f"{mode} {num}".strip()
+
+
+def _matches_type(di: dict, tipo: str) -> bool:
+    if not tipo:
+        return True
+    hay = _norm(
+        " ".join(
+            str(di.get(k, ""))
+            for k in ("commercial_mode", "physical_mode", "network", "name", "label")
+        )
+    )
+    return all(tok in hay for tok in _norm(tipo).split())
+
+
+def _delay_min(base: Optional[str], real: Optional[str]) -> int:
+    b, r = _parse_nav(base), _parse_nav(real)
+    if not b or not r:
+        return 0
+    return int((r - b).total_seconds() // 60)
+
+
+# ─────────────────────── precios (open data SNCF) ──────────────────────────
+# Rangos de TARIFA PLENA (mín–máx) por origen-destino y clase. No son el precio dinámico del día:
+# el precio real de reserva suele estar dentro (o por debajo, con tarjetas/promos) de ese rango.
+FARE_DATASETS = {
+    "intercites": "https://ressources.data.sncf.com/api/explore/v2.1/catalog/datasets/tarifs-intercites/exports/json",
+    "tgv": "https://ressources.data.sncf.com/api/explore/v2.1/catalog/datasets/tarifs-tgv-inoui-ouigo/exports/json",
+}
+
+
+def _station_tokens(name: str) -> frozenset:
+    """'Bordeaux Saint-Jean (Bordeaux)' y 'BORDEAUX ST JEAN' → {'bordeaux','st','jean'}."""
+    n = _norm((name or "").split("(")[0])
+    for a in "-'./,":
+        n = n.replace(a, " ")
+    n = n.replace("&", " ")
+    alias = {"saint": "st", "sainte": "ste"}
+    # ruido que difiere entre Navitia ('Paris - Montparnasse - Hall 1 & 2') y los datasets
+    # ('PARIS MONTPARNASSE 1 ET 2'): se ignora para comparar
+    noise = {"gare", "de", "du", "des", "d", "et", "and", "hall", "halls", "sncf", "voie", "quai"}
+    return frozenset(t for t in (alias.get(w, w) for w in n.split()) if t and t not in noise and not t.isdigit())
+
+
+def _find_key(rec: dict, *needles: str, exclude: tuple = ()) -> Optional[str]:
+    """Encuentra un campo por palabras clave (los nombres exactos de columnas del dataset pueden cambiar)."""
+    for k in rec:
+        nk = _norm(k).replace("_", " ")
+        if all(n in nk for n in needles) and not any(e in nk for e in exclude):
+            return k
+    return None
+
+
+def _to_float(v) -> Optional[float]:
+    try:
+        return float(str(v).replace(",", ".").replace("€", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _match_score(q: frozenset, c: frozenset) -> int:
+    """2 = mismo nombre, 1 = uno contiene al otro ('Paris' ⊂ 'Paris Austerlitz'), 0 = nada."""
+    if not q or not c:
+        return 0
+    if q == c:
+        return 3
+    if q <= c or c <= q:
+        return 2
+    # solapamiento parcial: misma ciudad y ≥ 2/3 de las palabras del nombre más corto
+    inter = len(q & c)
+    return 1 if inter >= 2 and inter / min(len(q), len(c)) >= 0.67 else 0
+
+
+def _dataset_for_mode(di: dict) -> Optional[str]:
+    m = _norm(f"{di.get('commercial_mode', '')} {di.get('physical_mode', '')} {di.get('network', '')}")
+    if "intercit" in m:
+        return "intercites"
+    if "tgv" in m or "inoui" in m or "ouigo" in m or "grande vitesse" in m:
+        return "tgv"
+    return None
+
+
+# ──────────────────────────────── la tool ──────────────────────────────────
+class Tools:
+    class Valves(BaseModel):
+        SNCF_API_KEY: str = Field(
+            default="", description="Token de numerique.sncf.com (se usa como usuario Basic Auth, password vacío)"
+        )
+        BASE_URL: str = Field(default="https://api.sncf.com/v1/coverage/sncf")
+        MAX_REQUESTS_PER_DAY: int = Field(
+            default=4500, description="Freno local para no rebasar las 5000 req/día gratuitas"
+        )
+        TIMEOUT_S: int = Field(default=20)
+        MAX_PAGINAS: int = Field(
+            default=8, description="Máx. llamadas encadenadas por consulta larga (día completo)"
+        )
+        FARES_CACHE_HOURS: int = Field(
+            default=24, description="Cada cuánto re-descargar los datasets de precios (no gastan cuota SNCF)"
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self._fares: dict[str, tuple[dt.datetime, list]] = {}
+        self._velib: dict[str, tuple[dt.datetime, Any]] = {}
+        self._station_cache: dict[str, tuple[str, str]] = {}
+        self._quota_day = None
+        self._quota_used = 0
+
+    # ───────────── núcleo HTTP ─────────────
+    def _count_request(self):
+        today = _now().date()
+        if self._quota_day != today:
+            self._quota_day, self._quota_used = today, 0
+        if self._quota_used >= self.valves.MAX_REQUESTS_PER_DAY:
+            raise RuntimeError(
+                f"Freno local alcanzado ({self._quota_used} req hoy). "
+                "Sube MAX_REQUESTS_PER_DAY en las Valves si de verdad lo necesitas."
+            )
+        self._quota_used += 1
+
+    def _get_sync(self, path: str, params: Any = None) -> dict:
+        if not self.valves.SNCF_API_KEY:
+            raise RuntimeError("Falta SNCF_API_KEY en las Valves de la tool.")
+        self._count_request()
+        url = path if path.startswith("http") else f"{self.valves.BASE_URL}/{path.lstrip('/')}"
+        r = requests.get(
+            url, params=params, auth=(self.valves.SNCF_API_KEY, ""), timeout=self.valves.TIMEOUT_S,
+            headers=HEADERS,
+        )
+        if r.status_code == 401:
+            raise RuntimeError("401: token SNCF inválido o aún no activo (tarda hasta 5 min).")
+        if r.status_code == 429:
+            raise RuntimeError("429: cuota de la API SNCF agotada.")
+        data = r.json() if r.content else {}
+        if r.status_code >= 400 and "error" not in data:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+        return data
+
+    async def _get(self, path: str, params: Any = None) -> dict:
+        return await asyncio.to_thread(self._get_sync, path, params)
+
+    @staticmethod
+    async def _status(emitter: EmitterT, msg: str, done: bool = False):
+        if emitter:
+            await emitter({"type": "status", "data": {"description": msg, "done": done}})
+
+    async def _resolve_station(self, name: str) -> tuple[str, str]:
+        """Nombre libre → (stop_area_id, nombre oficial). Acepta también un id 'stop_area:...'."""
+        if name.startswith("stop_area:"):
+            return name, name
+        key = _norm(name)
+        if key in self._station_cache:
+            return self._station_cache[key]
+        data = await self._get("places", [("q", name), ("type[]", "stop_area"), ("disable_geojson", "true")])
+        places = data.get("places") or []
+        if not places:
+            raise ValueError(f"No encontré ninguna estación para '{name}'.")
+        res = (places[0]["id"], places[0].get("name", name))
+        self._station_cache[key] = res
+        return res
+
+    @staticmethod
+    def _disruption_index(data: dict) -> dict:
+        return {d.get("id"): d for d in data.get("disruptions") or []}
+
+    @staticmethod
+    def _disruption_text(di: dict, idx: dict) -> str:
+        out = []
+        for link in di.get("links") or []:
+            if link.get("type") == "disruption" and link.get("id") in idx:
+                d = idx[link["id"]]
+                eff = (d.get("severity") or {}).get("effect", "")
+                cause = d.get("cause", "")
+                msg = ((d.get("messages") or [{}])[0]).get("text", "")
+                tag = {"NO_SERVICE": "❌ SUPRIMIDO", "SIGNIFICANT_DELAYS": "⏱️ retraso",
+                       "REDUCED_SERVICE": "⚠️ servicio reducido", "MODIFIED_SERVICE": "🔀 modificado",
+                       "ADDITIONAL_SERVICE": "➕ tren adicional"}.get(eff, eff)
+                out.append(" ".join(x for x in (tag, f"({cause})" if cause else "", msg[:160]) if x))
+        return " | ".join(out)
+
+    # ───────────── precios: carga y búsqueda ─────────────
+    def _load_fares_sync(self, ds: str) -> list:
+        cached = self._fares.get(ds)
+        if cached and _now() - cached[0] < dt.timedelta(hours=self.valves.FARES_CACHE_HOURS):
+            return cached[1]
+        r = requests.get(FARE_DATASETS[ds], timeout=60, headers=HEADERS)
+        r.raise_for_status()
+        raw = r.json()
+        rows = []
+        if raw:
+            s = raw[0]
+            k_o = _find_key(s, "origine", exclude=("uic", "code")) or _find_key(s, "depart", exclude=("uic", "code"))
+            k_d = _find_key(s, "destination", exclude=("uic", "code")) or _find_key(s, "arrivee", exclude=("uic", "code"))
+            k_min, k_max = _find_key(s, "min"), _find_key(s, "max")
+            k_cl = _find_key(s, "classe")
+            k_tr = _find_key(s, "transporteur") or _find_key(s, "marque") or _find_key(s, "produit")
+            k_pr = _find_key(s, "profil")
+            if not (k_o and k_d and (k_min or k_max)):
+                raise RuntimeError(f"Formato inesperado en el dataset {ds}: columnas {list(s)[:12]}")
+            for rec in raw:
+                rows.append({
+                    "o": str(rec.get(k_o, "")), "d": str(rec.get(k_d, "")),
+                    "ot": _station_tokens(str(rec.get(k_o, ""))), "dt": _station_tokens(str(rec.get(k_d, ""))),
+                    "min": _to_float(rec.get(k_min)) if k_min else None,
+                    "max": _to_float(rec.get(k_max)) if k_max else None,
+                    "classe": str(rec.get(k_cl, "")) if k_cl else "",
+                    "transp": str(rec.get(k_tr, "")) if k_tr else ("Intercités" if ds == "intercites" else ""),
+                    "profil": str(rec.get(k_pr, "")) if k_pr else "",
+                })
+        self._fares[ds] = (_now(), rows)
+        return rows
+
+    async def _fare_lookup(self, ds: str, origen: str, destino: str, transp: str = "") -> list:
+        """Filas de precio que casan con origen→destino (prueba también el sentido inverso)."""
+        rows = await asyncio.to_thread(self._load_fares_sync, ds)
+        qo, qd = _station_tokens(origen), _station_tokens(destino)
+        for a, b in ((qo, qd), (qd, qo)):
+            scored = []
+            for r in rows:
+                so, sd = _match_score(a, r["ot"]), _match_score(b, r["dt"])
+                if so and sd and (not transp or _norm(transp) in _norm(r["transp"])):
+                    scored.append((so + sd, r))
+            if scored:
+                best = max(s for s, _ in scored)
+                return [r for s, r in scored if s == best]
+        return []
+
+    @staticmethod
+    def _second_class(rows: list) -> list:
+        sec = [r for r in rows if "2" in r["classe"] or "second" in _norm(r["classe"])]
+        return sec or rows
+
+    @staticmethod
+    def _range(rows: list) -> tuple[Optional[float], Optional[float]]:
+        mins = [r["min"] for r in rows if r["min"] is not None]
+        maxs = [r["max"] for r in rows if r["max"] is not None]
+        return (min(mins) if mins else None, max(maxs) if maxs else None)
+
+    async def _section_price(self, s: dict) -> tuple[Optional[float], Optional[float], str]:
+        di = s.get("display_informations") or {}
+        ds = _dataset_for_mode(di)
+        if not ds:
+            return None, None, "sin dato abierto (TER/car: tarifa regional, ver SNCF Connect)"
+        transp = "ouigo" if "ouigo" in _norm(di.get("commercial_mode", "")) else ""
+        try:
+            rows = await self._fare_lookup(ds, s["from"].get("name", ""), s["to"].get("name", ""), transp)
+        except Exception as e:
+            return None, None, f"error al leer precios ({e})"
+        if not rows:
+            return None, None, "par de estaciones no listado en el dataset"
+        lo, hi = self._range(self._second_class(rows))
+        return lo, hi, ""
+
+    # ───────────── 0. precios ─────────────
+    async def rango_precios(
+        self, origen: str, destino: str, tipo: str = "", __event_emitter__: EmitterT = None
+    ) -> str:
+        """
+        Rango oficial de precios (tarifa plena mín–máx, open data SNCF) entre dos estaciones para TGV INOUI,
+        OUIGO e Intercités, por clase. No cubre TER ni descuentos/tarjetas; el precio real de reserva del día
+        suele caer dentro de ese rango (o por debajo con tarjeta Avantage/promos). No gasta cuota de la API.
+        :param origen: Estación de salida, p. ej. 'Bordeaux Saint-Jean'.
+        :param destino: Estación de llegada, p. ej. 'La Rochelle Ville'.
+        :param tipo: Opcional: 'TGV', 'INOUI', 'OUIGO' o 'Intercités' para limitar la búsqueda.
+        """
+        await self._status(__event_emitter__, f"Buscando precios {origen} → {destino}…")
+        t = _norm(tipo)
+        sets = ["intercites"] if "intercit" in t else ["tgv"] if t else ["tgv", "intercites"]
+        transp = "ouigo" if "ouigo" in t else "inoui" if "inoui" in t else ""
+        found = []
+        for ds in sets:
+            try:
+                found += await self._fare_lookup(ds, origen, destino, transp)
+            except Exception as e:
+                found.append({"error": f"{ds}: {e}"})
+        await self._status(__event_emitter__, "Listo", True)
+        errs = [f["error"] for f in found if "error" in f]
+        rows = [f for f in found if "error" not in f]
+        if not rows:
+            return (f"No hay precios publicados para {origen} → {destino} en TGV/OUIGO/Intercités "
+                    "(si es una ruta solo TER, su tarifa no está en estos datasets)."
+                    + (f" Errores: {'; '.join(errs)}" if errs else ""))
+        out = [f"Precios **tarifa plena** (open data SNCF) {origen} → {destino}:"]
+        seen = set()
+        for r in sorted(rows, key=lambda r: (r["transp"], r["classe"], r["min"] or 0)):
+            key = (r["o"], r["d"], r["transp"], r["classe"], r["profil"])
+            if key in seen:
+                continue
+            seen.add(key)
+            lo = f"{r['min']:.2f}" if r["min"] is not None else "?"
+            hi = f"{r['max']:.2f}" if r["max"] is not None else "?"
+            extra = f" · {r['profil']}" if r["profil"] else ""
+            out.append(f"- {r['transp'] or 'Tren'} · clase {r['classe'] or '?'}{extra} · {r['o']} → {r['d']}: "
+                       f"**{lo} – {hi} €**")
+        out.append("_Rangos de tarifa plena; el precio del día depende de la demanda y de tus tarjetas._")
+        return "\n".join(out)
+
+    # ───────────── 1. buscar estación ─────────────
+    async def buscar_estacion(self, nombre: str, __event_emitter__: EmitterT = None) -> str:
+        """
+        Busca estaciones de tren SNCF por nombre (autocompletado) y devuelve sus ids.
+        Úsalo cuando el nombre de la estación sea ambiguo (p. ej. 'Paris' tiene varias gares).
+        :param nombre: Texto a buscar, p. ej. 'Agen', 'Paris Austerlitz', 'Lyon Part-Dieu'.
+        """
+        await self._status(__event_emitter__, f"Buscando estación '{nombre}'…")
+        data = await self._get("places", [("q", nombre), ("type[]", "stop_area"), ("disable_geojson", "true")])
+        places = data.get("places") or []
+        await self._status(__event_emitter__, "Listo", True)
+        if not places:
+            return f"No hay estaciones que coincidan con '{nombre}'."
+        lines = [f"Estaciones para '{nombre}':"]
+        for p in places[:10]:
+            c = (p.get("stop_area") or {}).get("coord") or {}
+            lines.append(f"- {p.get('name')} — id `{p['id']}` (lat {c.get('lat')}, lon {c.get('lon')})")
+        return "\n".join(lines)
+
+    # ───────────── 2/3. salidas y llegadas ─────────────
+    async def _board(self, kind: str, estacion, fecha, hora, horas, tipo, destino_texto, max_trenes, emitter) -> str:
+        start = _parse_user_dt(fecha, hora)
+        sa_id, sa_name = await self._resolve_station(estacion)
+        await self._status(emitter, f"Consultando {kind} en {sa_name}…")
+        params = {
+            "from_datetime": _to_nav(start),
+            "duration": int(float(horas) * 3600),
+            "count": 200,
+            "data_freshness": "realtime",
+            "depth": 1,
+            "disable_geojson": "true",
+        }
+        rows, page = [], 0
+        while page < self.valves.MAX_PAGINAS:
+            params["start_page"] = page
+            data = await self._get(f"stop_areas/{sa_id}/{kind}", params)
+            if "error" in data:
+                return f"API SNCF: {data['error'].get('message')}"
+            idx = self._disruption_index(data)
+            items = data.get(kind) or []
+            for it in items:
+                di = it.get("display_informations") or {}
+                if not _matches_type(di, tipo):
+                    continue
+                if destino_texto and _norm(destino_texto) not in _norm(di.get("direction", "")):
+                    continue
+                sdt = it.get("stop_date_time") or {}
+                key = "departure" if kind == "departures" else "arrival"
+                real = sdt.get(f"{key}_date_time")
+                base = sdt.get(f"base_{key}_date_time") or real
+                rows.append((real, base, di, self._disruption_text(di, idx), it))
+            pag = data.get("pagination") or {}
+            if len(items) < params["count"] or (page + 1) * params["count"] >= pag.get("total_result", 0):
+                break
+            page += 1
+        await self._status(emitter, "Listo", True)
+        if not rows:
+            return f"No hay {kind} en {sa_name} entre {_hm(start)} y +{horas} h con esos filtros."
+        verbo = "Salidas desde" if kind == "departures" else "Llegadas a"
+        out = [f"{verbo} **{sa_name}** — {DIAS[start.weekday()]} {start:%d/%m/%Y} desde {_hm(start)} (+{horas} h), tiempo real:",
+               _fecha_echo(fecha, start, hora=hora, horas=horas, tipo=tipo, destino_texto=destino_texto)]
+        for real, base, di, dtext, it in rows[: int(max_trenes)]:
+            delay = _delay_min(base, real)
+            dtag = f" ⏱️ +{delay} min (prevista {_hm(_parse_nav(base))})" if delay > 0 else ""
+            sentido = "→" if kind == "departures" else "←"
+            other = di.get("direction", "") if kind == "departures" else (it.get("route") or {}).get(
+                "direction", {}).get("name", di.get("direction", ""))
+            out.append(f"- {_hm(_parse_nav(real))} {_train_label(di)} {sentido} {other}{dtag}"
+                       + (f" — {dtext}" if dtext else ""))
+        if len(rows) > int(max_trenes):
+            out.append(f"…y {len(rows) - int(max_trenes)} más (sube max_trenes para verlos).")
+        return "\n".join(out)
+
+    async def salidas_estacion(
+        self, estacion: str, fecha: str, hora: str = "", horas: float = 3,
+        tipo: str = "", destino_texto: str = "", max_trenes: int = 30,
+        __event_emitter__: EmitterT = None,
+    ) -> str:
+        """
+        Tablero de SALIDAS de una estación en tiempo real (retrasos y supresiones incluidos).
+        :param estacion: Nombre de la estación, p. ej. 'Paris Austerlitz'.
+        :param fecha: OBLIGATORIO. Fecha del viaje: 'AAAA-MM-DD' (p. ej. '2026-10-17'), 'DD/MM', 'hoy', 'mañana' o un día de la semana ('sábado'). Pásala SIEMPRE, también si es hoy.
+        :param hora: HH:MM desde la que buscar. Vacío = ahora.
+        :param horas: Ventana de tiempo en horas (máx. 24).
+        :param tipo: Filtro opcional por tipo de tren: 'TGV', 'INOUI', 'OUIGO', 'TER', 'Intercités', 'Car'.
+        :param destino_texto: Filtro opcional: texto que debe aparecer en la dirección/terminal del tren.
+        :param max_trenes: Máximo de trenes a listar.
+        """
+        return await self._board("departures", estacion, fecha, hora, min(float(horas), 24), tipo,
+                                 destino_texto, max_trenes, __event_emitter__)
+
+    async def llegadas_estacion(
+        self, estacion: str, fecha: str, hora: str = "", horas: float = 3,
+        tipo: str = "", max_trenes: int = 30, __event_emitter__: EmitterT = None,
+    ) -> str:
+        """
+        Tablero de LLEGADAS a una estación en tiempo real, a partir de una hora dada.
+        :param estacion: Nombre de la estación, p. ej. 'Agen'.
+        :param fecha: OBLIGATORIO. Fecha del viaje: 'AAAA-MM-DD' (p. ej. '2026-10-17'), 'DD/MM', 'hoy', 'mañana' o un día de la semana ('sábado'). Pásala SIEMPRE, también si es hoy.
+        :param hora: HH:MM desde la que buscar. Vacío = ahora.
+        :param horas: Ventana de tiempo en horas (máx. 24).
+        :param tipo: Filtro opcional por tipo: 'TGV', 'OUIGO', 'TER', 'Intercités'…
+        :param max_trenes: Máximo de trenes a listar.
+        """
+        return await self._board("arrivals", estacion, fecha, hora, min(float(horas), 24), tipo,
+                                 "", max_trenes, __event_emitter__)
+
+    # ───────────── 4. itinerarios A → B ─────────────
+    async def itinerarios(
+        self, origen: str, destino: str, fecha: str, desde_hora: str = "", hasta_hora: str = "23:59",
+        solo_directos: bool = False, max_transbordos: int = 3, tipo: str = "",
+        con_precios: bool = True, __event_emitter__: EmitterT = None,
+    ) -> str:
+        """
+        Todas las rutas en tren de A a B en un día (o una franja horaria), con transbordos.
+        Con solo_directos=True responde '¿qué trenes salen de A con destino/parada en B?'.
+        :param origen: Estación de salida, p. ej. 'Agen'.
+        :param destino: Estación de llegada, p. ej. 'Paris Austerlitz' o solo 'Paris'.
+        :param fecha: OBLIGATORIO. Fecha del viaje: 'AAAA-MM-DD' (p. ej. '2026-10-17'), 'DD/MM', 'hoy', 'mañana' o un día de la semana ('sábado'). Pásala SIEMPRE, también si es hoy.
+        :param desde_hora: HH:MM de inicio de la franja. Vacío = ahora (hoy) o 00:00 (otro día).
+        :param hasta_hora: HH:MM de fin de la franja (salida máxima).
+        :param solo_directos: True = solo trenes sin transbordo.
+        :param max_transbordos: Máximo de transbordos permitidos.
+        :param tipo: Filtro opcional: solo itinerarios que usen ese tipo (p. ej. 'TER' para evitar TGV).
+        :param con_precios: True = añade el rango de tarifa plena 2ª clase por tramo (TGV/OUIGO/Intercités).
+        """
+        start = _parse_user_dt(fecha, desde_hora)
+        end = _parse_user_dt(start.strftime("%Y-%m-%d"), hasta_hora or "23:59")
+        (o_id, o_name), (d_id, d_name) = await asyncio.gather(
+            self._resolve_station(origen), self._resolve_station(destino))
+        await self._status(__event_emitter__, f"Calculando itinerarios {o_name} → {d_name}…")
+        realtime = start.date() <= (_now().date() + dt.timedelta(days=1))
+        seen, journeys, cursor, calls = set(), [], start, 0
+        while cursor <= end and calls < self.valves.MAX_PAGINAS:
+            calls += 1
+            data = await self._get("journeys", {
+                "from": o_id, "to": d_id, "datetime": _to_nav(cursor),
+                "datetime_represents": "departure",
+                "max_nb_transfers": 0 if solo_directos else int(max_transbordos),
+                "max_nb_journeys": 10, "min_nb_journeys": 3, "direct_path": "none",
+                "data_freshness": "realtime" if realtime else "base_schedule",
+                "disable_geojson": "true", "depth": 0,
+            })
+            if "error" in data:
+                if not journeys:
+                    return f"Sin itinerarios: {data['error'].get('message')}"
+                break
+            batch = data.get("journeys") or []
+            if not batch:
+                break
+            latest = cursor
+            for j in batch:
+                dep = _parse_nav(j.get("departure_date_time"))
+                if dep:
+                    latest = max(latest, dep)
+                if not dep or dep > end:
+                    continue
+                pts = [s for s in j.get("sections", []) if s.get("type") == "public_transport"]
+                if tipo and not any(_matches_type(s.get("display_informations") or {}, tipo) for s in pts):
+                    continue
+                sig = (j.get("departure_date_time"), j.get("arrival_date_time"),
+                       tuple(_train_label(s.get("display_informations") or {}) for s in pts))
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                journeys.append(j)
+            # avanzar al minuto siguiente de la última salida vista; si la API no avanzó, saltar 30 min
+            new_cursor = latest + dt.timedelta(minutes=1)
+            if new_cursor <= cursor + dt.timedelta(minutes=1):
+                new_cursor = cursor + dt.timedelta(minutes=30)
+            cursor = new_cursor
+        await self._status(__event_emitter__, "Listo", True)
+        if not journeys:
+            return f"No encontré trenes {o_name} → {d_name} entre {_hm(start)} y {_hm(end)} el {start:%d/%m/%Y}."
+        journeys.sort(key=lambda j: j.get("departure_date_time", ""))
+        out = [f"**{o_name} → {d_name}** — {DIAS[start.weekday()]} {start:%d/%m/%Y}, {_hm(start)}–{_hm(end)} "
+               f"({'tiempo real' if realtime else 'horario teórico'}): {len(journeys)} opciones",
+               _fecha_echo(fecha, start, desde_hora=desde_hora, hasta_hora=hasta_hora, solo_directos=solo_directos, max_transbordos=max_transbordos, tipo=tipo)]
+        if con_precios:
+            await self._status(__event_emitter__, "Añadiendo rangos de precio…")
+        for n, j in enumerate(journeys, 1):
+            dur = int(j.get("duration", 0)) // 60
+            status = j.get("status") or ""
+            st = {"NO_SERVICE": " ❌ afectado por supresión", "SIGNIFICANT_DELAYS": " ⏱️ con retraso",
+                  "MODIFIED_SERVICE": " 🔀 modificado"}.get(status, "")
+            head_idx = len(out)
+            out.append(f"\n{n}. {_hm(_parse_nav(j['departure_date_time']))} → "
+                       f"{_hm(_parse_nav(j['arrival_date_time']))} ({dur // 60}h{dur % 60:02d}, "
+                       f"{j.get('nb_transfers', 0)} transbordo(s)){st}")
+            tot_lo, tot_hi, complete = 0.0, 0.0, True
+            for s in j.get("sections", []):
+                if s.get("type") != "public_transport":
+                    continue
+                di = s.get("display_informations") or {}
+                delay = _delay_min(s.get("base_departure_date_time"), s.get("departure_date_time"))
+                price = ""
+                if con_precios:
+                    lo, hi, why = await self._section_price(s)
+                    if lo is not None or hi is not None:
+                        price = f" · 💶 {lo or 0:.0f}–{hi or lo or 0:.0f} €"
+                        tot_lo += lo or 0
+                        tot_hi += hi or lo or 0
+                    else:
+                        price = f" · 💶 {why}"
+                        complete = False
+                out.append(f"   - {_train_label(di)}: {s['from'].get('name')} {_hm(_parse_nav(s.get('departure_date_time')))}"
+                           f" → {s['to'].get('name')} {_hm(_parse_nav(s.get('arrival_date_time')))}"
+                           + (f" (⏱️ +{delay} min)" if delay > 0 else "") + price)
+            if con_precios and (tot_lo or tot_hi):
+                out[head_idx] += (f" — 💶 total {tot_lo:.0f}–{tot_hi:.0f} €" if complete
+                                  else f" — 💶 parcial ≥ {tot_lo:.0f} € (falta tramo TER)")
+        if con_precios:
+            out.append("\n_💶 = rango de tarifa plena 2ª clase (open data SNCF). TER no publicado; "
+                       "el precio real del día puede ser menor._")
+        if cursor <= end and calls >= self.valves.MAX_PAGINAS:
+            out.append(f"\n(Corté en {calls} llamadas por cuota; pide desde_hora={_hm(cursor)} para seguir.)")
+        await self._status(__event_emitter__, "Listo", True)
+        return "\n".join(out)
+
+    # ───────────── 5. contar trenes del día ─────────────
+    async def contar_trenes_dia(
+        self, estacion: str, fecha: str = "", sentido: str = "salidas", __event_emitter__: EmitterT = None
+    ) -> str:
+        """
+        Cuenta cuántos trenes salen (o llegan) en una estación durante un día completo, agrupados por tipo
+        (TGV INOUI, OUIGO, TER, Intercités, autocares…) y por destino principal.
+        :param estacion: Nombre de la estación.
+        :param fecha: AAAA-MM-DD, 'hoy' o 'mañana'. Vacío = hoy.
+        :param sentido: 'salidas' o 'llegadas'.
+        """
+        start = _parse_user_dt(fecha, "00:00")
+        kind = "arrivals" if _norm(sentido).startswith("lleg") else "departures"
+        sa_id, sa_name = await self._resolve_station(estacion)
+        await self._status(__event_emitter__, f"Contando {sentido} del {start:%d/%m} en {sa_name}…")
+        by_type: dict[str, int] = {}
+        by_dir: dict[str, int] = {}
+        total, page = 0, 0
+        while page < self.valves.MAX_PAGINAS:
+            data = await self._get(f"stop_areas/{sa_id}/{kind}", {
+                "from_datetime": _to_nav(start), "duration": 86400, "count": 200,
+                "start_page": page, "data_freshness": "base_schedule", "depth": 0,
+                "disable_geojson": "true"})
+            items = data.get(kind) or []
+            for it in items:
+                di = it.get("display_informations") or {}
+                t = di.get("commercial_mode") or di.get("physical_mode") or "?"
+                by_type[t] = by_type.get(t, 0) + 1
+                d = di.get("direction", "?")
+                by_dir[d] = by_dir.get(d, 0) + 1
+                total += 1
+            if len(items) < 200:
+                break
+            page += 1
+        await self._status(__event_emitter__, "Listo", True)
+        out = [f"**{sa_name}** — {sentido} el {start:%d/%m/%Y} (horario teórico): **{total} trenes**", "", "Por tipo:"]
+        out += [f"- {k}: {v}" for k, v in sorted(by_type.items(), key=lambda x: -x[1])]
+        out += ["", "Top direcciones:"]
+        out += [f"- {k}: {v}" for k, v in sorted(by_dir.items(), key=lambda x: -x[1])[:12]]
+        return "\n".join(out)
+
+    # ───────────── 6. estado / posición estimada de un tren ─────────────
+    async def estado_tren(self, numero_tren: str, fecha: str = "", __event_emitter__: EmitterT = None) -> str:
+        """
+        Estado de un tren por su número (p. ej. '8519', '866012'): todas sus paradas con horarios reales,
+        retrasos, supresiones y su POSICIÓN ESTIMADA ahora (entre qué estaciones va, con coordenadas
+        interpoladas). Nota: la API SNCF no da GPS; la posición se calcula con los horarios en tiempo real.
+        :param numero_tren: Número de circulación que aparece en el billete/panel.
+        :param fecha: AAAA-MM-DD. Vacío = hoy.
+        """
+        day = _parse_user_dt(fecha, "00:00")
+        await self._status(__event_emitter__, f"Buscando el tren {numero_tren}…")
+        data = await self._get("vehicle_journeys", {
+            "headsign": numero_tren.strip(),
+            "since": _to_nav(day), "until": _to_nav(day.replace(hour=23, minute=59, second=59)),
+            "data_freshness": "realtime", "depth": 2, "disable_geojson": "true"})
+        vjs = data.get("vehicle_journeys") or []
+        if "error" in data or not vjs:
+            # reintento sin tiempo real (trenes de otros días / sin datos RT)
+            data = await self._get("vehicle_journeys", {
+                "headsign": numero_tren.strip(), "since": _to_nav(day),
+                "until": _to_nav(day.replace(hour=23, minute=59, second=59)), "depth": 2,
+                "disable_geojson": "true"})
+            vjs = data.get("vehicle_journeys") or []
+        await self._status(__event_emitter__, "Listo", True)
+        if not vjs:
+            return f"No encontré el tren {numero_tren} el {day:%d/%m/%Y}."
+        vj = next((v for v in vjs if "RealTime" in v.get("id", "")), vjs[0])
+        is_rt = "RealTime" in vj.get("id", "")
+
+        # retrasos por parada desde los objetos disruption
+        amended: dict[str, tuple[str, str, str]] = {}
+        cancelled, causes = False, set()
+        for d in data.get("disruptions") or []:
+            if (d.get("severity") or {}).get("effect") == "NO_SERVICE":
+                cancelled = True
+            for io in d.get("impacted_objects") or []:
+                for s in io.get("impacted_stops") or []:
+                    nm = (s.get("stop_point") or {}).get("name", "")
+                    amended[nm] = (s.get("base_departure_time") or s.get("base_arrival_time") or "",
+                                   s.get("amended_departure_time") or s.get("amended_arrival_time") or "",
+                                   s.get("stop_time_effect") or "")
+                    if s.get("cause"):
+                        causes.add(s["cause"])
+
+        # reconstruir horarios con cambio de día
+        stops, prev = [], None
+        for st in vj.get("stop_times") or []:
+            def mk(t):
+                nonlocal prev
+                if not t:
+                    return None
+                d = dt.datetime.combine(day.date(), dt.datetime.strptime(t, "%H%M%S").time()).replace(tzinfo=TZ)
+                while prev and d < prev - dt.timedelta(hours=6):
+                    d += dt.timedelta(days=1)
+                prev = d
+                return d
+            arr = mk(st.get("arrival_time"))
+            dep = mk(st.get("departure_time")) or arr
+            sp = st.get("stop_point") or {}
+            stops.append({"name": sp.get("name", "?"), "arr": arr or dep, "dep": dep, "coord": sp.get("coord") or {}})
+
+        di = vj.get("display_informations") or {}
+        label = f"{(di.get('commercial_mode') or vj.get('name') or 'Tren')} {numero_tren}"
+        out = [f"**{label}** — {day:%d/%m/%Y} ({'tiempo real' if is_rt else 'horario teórico'})"]
+        if cancelled:
+            out.append("❌ **Tren suprimido (total o parcialmente)**")
+        if causes:
+            out.append("Causa: " + ", ".join(causes))
+        for s in stops:
+            extra = ""
+            if s["name"] in amended:
+                b, a, eff = amended[s["name"]]
+                if eff == "deleted":
+                    extra = " ❌ parada suprimida"
+                elif b and a and a != b:
+                    extra = f" ⏱️ (prevista {b[:2]}:{b[2:4]})"
+            out.append(f"- {_hm(s['arr'])}/{_hm(s['dep'])} {s['name']}{extra}")
+
+        # posición estimada
+        now = _now()
+        if stops and day.date() == now.date():
+            if now < stops[0]["dep"]:
+                out.append(f"\n📍 Aún no sale: parte de {stops[0]['name']} a las {_hm(stops[0]['dep'])}.")
+            elif now >= stops[-1]["arr"]:
+                out.append(f"\n📍 Ya llegó a {stops[-1]['name']} ({_hm(stops[-1]['arr'])}).")
+            else:
+                for a, b in zip(stops, stops[1:]):
+                    if a["arr"] <= now <= a["dep"]:
+                        out.append(f"\n📍 Detenido ahora en **{a['name']}** (sale {_hm(a['dep'])}).")
+                        break
+                    if a["dep"] < now < b["arr"]:
+                        frac = (now - a["dep"]) / (b["arr"] - a["dep"])
+                        pos = ""
+                        if a["coord"] and b["coord"]:
+                            lat = float(a["coord"]["lat"]) + frac * (float(b["coord"]["lat"]) - float(a["coord"]["lat"]))
+                            lon = float(a["coord"]["lon"]) + frac * (float(b["coord"]["lon"]) - float(a["coord"]["lon"]))
+                            pos = f" ≈ ({lat:.4f}, {lon:.4f}) https://www.openstreetmap.org/?mlat={lat:.4f}&mlon={lon:.4f}#map=11/{lat:.4f}/{lon:.4f}"
+                        out.append(f"\n📍 En ruta entre **{a['name']}** y **{b['name']}** "
+                                   f"(~{frac:.0%} del tramo, llega {_hm(b['arr'])}){pos}")
+                        break
+            out.append("_(posición estimada a partir de horarios, no GPS)_")
+        return "\n".join(out)
+
+    # ───────────── 7. perturbaciones ─────────────
+    async def perturbaciones(self, estacion: str = "", __event_emitter__: EmitterT = None) -> str:
+        """
+        Perturbaciones activas (obras, incidentes, huelgas, supresiones). Con estacion: solo las que afectan
+        a esa estación; sin estacion: resumen nacional de la red SNCF.
+        :param estacion: Nombre de la estación (opcional).
+        """
+        now = _now()
+        params = {"since": _to_nav(now), "until": _to_nav(now + dt.timedelta(hours=12)),
+                  "count": 50, "depth": 1, "disable_geojson": "true"}
+        if estacion:
+            sa_id, sa_name = await self._resolve_station(estacion)
+            path, title = f"stop_areas/{sa_id}/disruptions", f"en {sa_name}"
+        else:
+            path, title = "disruptions", "en la red SNCF"
+        await self._status(__event_emitter__, f"Consultando perturbaciones {title}…")
+        data = await self._get(path, params)
+        await self._status(__event_emitter__, "Listo", True)
+        ds = data.get("disruptions") or []
+        if not ds:
+            return f"Sin perturbaciones activas {title} en las próximas 12 h."
+        out = [f"Perturbaciones {title} (próx. 12 h): {len(ds)}"]
+        for d in ds[:25]:
+            eff = (d.get("severity") or {}).get("effect", "")
+            msg = ((d.get("messages") or [{}])[0]).get("text", "")
+            objs = ", ".join(
+                (io.get("pt_object") or {}).get("name", "") for io in (d.get("impacted_objects") or [])[:3])
+            out.append(f"- [{eff}] {objs} — {d.get('cause', '')} {msg[:200]}".strip())
+        return "\n".join(out)
+
+    # ───────────── 8. estaciones cercanas ─────────────
+    async def estaciones_cercanas(
+        self, lat: float, lon: float, radio_m: int = 3000, __event_emitter__: EmitterT = None
+    ) -> str:
+        """
+        Estaciones de tren SNCF cercanas a unas coordenadas.
+        :param lat: Latitud (p. ej. 48.8336).
+        :param lon: Longitud (p. ej. 2.3423).
+        :param radio_m: Radio de búsqueda en metros.
+        """
+        await self._status(__event_emitter__, "Buscando estaciones cercanas…")
+        data = await self._get(f"coords/{lon};{lat}/places_nearby", [
+            ("type[]", "stop_area"), ("distance", int(radio_m)), ("count", 15), ("disable_geojson", "true")])
+        await self._status(__event_emitter__, "Listo", True)
+        ps = data.get("places_nearby") or []
+        if not ps:
+            return f"No hay estaciones SNCF a menos de {radio_m} m."
+        return "\n".join([f"Estaciones a < {radio_m} m:"] +
+                         [f"- {p.get('name')} — {p.get('distance')} m (id `{p['id']}`)" for p in ps])
+
+    # ───────────── 10. isócrona: destinos alcanzables ─────────────
+    async def destinos_alcanzables(
+        self, origen: str, fecha: str, hora: str, max_horas: float = 3.0, min_horas: float = 0.0,
+        max_transbordos: int = 1, solo_directos: bool = False, max_resultados: int = 40,
+        __event_emitter__: EmitterT = None,
+    ) -> str:
+        """
+        ISÓCRONA: lista todas las estaciones a las que se llega en tren desde un origen en menos de X horas,
+        saliendo a partir de una fecha/hora, ordenadas por tiempo de viaje. Ideal para '¿a dónde puedo ir de
+        escapada en menos de 2 h desde París el sábado por la mañana?'. Usa 1 sola petición a la API.
+        :param origen: Estación de salida, p. ej. 'Paris Austerlitz' o 'Paris Montparnasse'.
+        :param fecha: OBLIGATORIO. Fecha del viaje: 'AAAA-MM-DD' (p. ej. '2026-10-17'), 'DD/MM', 'hoy', 'mañana' o un día de la semana ('sábado'). Pásala SIEMPRE, también si es hoy.
+        :param hora: OBLIGATORIO. HH:MM de salida mínima (p. ej. '08:00'). Sin hora la isócrona no tiene sentido.
+        :param max_horas: Tiempo máximo de viaje en horas.
+        :param min_horas: Oculta destinos más cercanos que esto (útil para no listar el extrarradio).
+        :param max_transbordos: Máximo de transbordos.
+        :param solo_directos: True = solo trenes directos.
+        :param max_resultados: Máximo de destinos a listar.
+        """
+        start = _parse_user_dt(fecha, hora)
+        o_id, o_name = await self._resolve_station(origen)
+        await self._status(__event_emitter__, f"Calculando destinos a < {max_horas} h desde {o_name}…")
+        data = await self._get("journeys", {
+            "from": o_id, "datetime": _to_nav(start), "datetime_represents": "departure",
+            "max_duration": int(float(max_horas) * 3600),
+            "max_nb_transfers": 0 if solo_directos else int(max_transbordos),
+            "data_freshness": "base_schedule", "depth": 1, "disable_geojson": "true",
+        })
+        await self._status(__event_emitter__, "Listo", True)
+        if "error" in data:
+            return f"API SNCF: {data['error'].get('message')}"
+        best: dict[str, dict] = {}
+        origin_key = _station_tokens(o_name)
+        for j in data.get("journeys") or []:
+            to = j.get("to") or {}
+            sa = (to.get("stop_point") or {}).get("stop_area") or to.get("stop_area") or {}
+            name = sa.get("name") or to.get("name") or "?"
+            key = _norm(name.split("(")[0])
+            if _station_tokens(name) == origin_key:
+                continue
+            dep, arr = _parse_nav(j.get("departure_date_time")), _parse_nav(j.get("arrival_date_time"))
+            # tiempo total desde la hora pedida (incluye espera), que es lo que importa al planear
+            total = (arr - start).total_seconds() / 3600 if arr else j.get("duration", 0) / 3600
+            if total < float(min_horas):
+                continue
+            if key not in best or total < best[key]["total"]:
+                best[key] = {"name": name, "total": total, "dep": dep, "arr": arr,
+                             "tr": j.get("nb_transfers", 0)}
+        if not best:
+            return (f"Sin destinos alcanzables desde {o_name} en < {max_horas} h a partir de "
+                    f"{start:%d/%m %H:%M} (prueba otra hora o más transbordos).\n"
+                    + _fecha_echo(fecha, start, hora=hora, max_horas=max_horas, min_horas=min_horas))
+        rows = sorted(best.values(), key=lambda r: r["total"])
+        out = [f"Destinos alcanzables desde **{o_name}** — salida desde {start:%d/%m/%Y %H:%M}, "
+               f"< {max_horas} h, ≤ {0 if solo_directos else max_transbordos} transbordo(s): {len(rows)} estaciones",
+               _fecha_echo(fecha, start, hora=hora, max_horas=max_horas, min_horas=min_horas, max_transbordos=max_transbordos, solo_directos=solo_directos)]
+        for r in rows[: int(max_resultados)]:
+            h = int(r["total"] * 60)
+            out.append(f"- {r['name']}: {h // 60}h{h % 60:02d} (sale {_hm(r['dep'])}, llega {_hm(r['arr'])}, "
+                       f"{r['tr']} transb.)")
+        if len(rows) > int(max_resultados):
+            out.append(f"…y {len(rows) - int(max_resultados)} más (sube max_resultados o min_horas).")
+        out.append("_Tiempo = desde la hora pedida hasta la llegada (incluye espera). Horario teórico._")
+        return "\n".join(out)
+
+    # ───────────── 11. Vélib (GBFS abierto, sin llave) ─────────────
+    VELIB_INFO = "https://velib-metropole-opendata.smovengo.cloud/opendata/Velib_Metropole/station_information.json"
+    VELIB_STATUS = "https://velib-metropole-opendata.smovengo.cloud/opendata/Velib_Metropole/station_status.json"
+    # Respaldo: espejo oficial de la Ville de Paris (Opendatasoft), mismo dato, otro servidor
+    VELIB_PARIS = ("https://opendata.paris.fr/api/explore/v2.1/catalog/datasets/"
+                   "velib-disponibilite-en-temps-reel/exports/json")
+
+    def _velib_gbfs_sync(self) -> list:
+        def get(url):
+            r = requests.get(url, timeout=self.valves.TIMEOUT_S, headers=HEADERS)
+            r.raise_for_status()
+            return (r.json().get("data") or {}).get("stations") or []
+        cached = self._velib.get("info")
+        if cached and _now() - cached[0] < dt.timedelta(hours=24):
+            info = cached[1]
+        else:
+            info = get(self.VELIB_INFO)
+            self._velib["info"] = (_now(), info)
+        st_by_id = {x.get("station_id"): x for x in get(self.VELIB_STATUS)}
+        out = []
+        for s in info:
+            st = st_by_id.get(s.get("station_id"), {})
+            types = {}
+            for t in st.get("num_bikes_available_types") or []:
+                types.update(t)
+            out.append({
+                "name": s.get("name", "?"), "lat": float(s["lat"]), "lon": float(s["lon"]),
+                "mech": int(types.get("mechanical", 0)), "ebike": int(types.get("ebike", 0)),
+                "docks": st.get("num_docks_available", "?"),
+                "ok": bool(st.get("is_renting", 1) and st.get("is_installed", 1)),
+                "ts": st.get("last_reported"),
+            })
+        return out
+
+    def _velib_paris_sync(self) -> list:
+        r = requests.get(self.VELIB_PARIS, timeout=60, headers=HEADERS)
+        r.raise_for_status()
+        out = []
+        for rec in r.json() or []:
+            geo = rec.get(_find_key(rec, "geo") or "", None) or {}
+            if not isinstance(geo, dict) or "lat" not in geo:
+                continue
+            k_dock = _find_key(rec, "numdocks") or _find_key(rec, "docks")
+            k_rent = _find_key(rec, "renting")
+            rent = _norm(str(rec.get(k_rent, "oui"))) if k_rent else "oui"
+            out.append({
+                "name": rec.get("name", "?"), "lat": float(geo["lat"]), "lon": float(geo["lon"]),
+                "mech": int(_to_float(rec.get("mechanical")) or 0), "ebike": int(_to_float(rec.get("ebike")) or 0),
+                "docks": rec.get(k_dock, "?") if k_dock else "?",
+                "ok": rent in ("oui", "yes", "1", "true"), "ts": None,
+            })
+        return out
+
+    def _velib_load_sync(self) -> tuple[list, str]:
+        cached = self._velib.get("live")
+        if cached and _now() - cached[0] < dt.timedelta(seconds=60):
+            return cached[1]
+        errors = []
+        for label, fn in (("GBFS Smovengo", self._velib_gbfs_sync), ("Paris Open Data", self._velib_paris_sync)):
+            try:
+                data = fn()
+                if data:
+                    self._velib["live"] = (_now(), (data, label))
+                    return data, label
+                errors.append(f"{label}: respuesta vacía")
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+        raise RuntimeError("Ninguna fuente Vélib respondió → " + " | ".join(errors))
+
+    @staticmethod
+    def _haversine_m(lat1, lon1, lat2, lon2) -> float:
+        import math
+        p = math.pi / 180
+        a = (math.sin((lat2 - lat1) * p / 2) ** 2
+             + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin((lon2 - lon1) * p / 2) ** 2)
+        return 12742000 * math.asin(math.sqrt(a))
+
+    async def velib_cerca(
+        self, lugar: str = "", lat: float = 0.0, lon: float = 0.0, radio_m: int = 500,
+        max_estaciones: int = 8, solo_electricas: bool = False, __event_emitter__: EmitterT = None,
+    ) -> str:
+        """
+        Disponibilidad Vélib en TIEMPO REAL (París y área metropolitana): bicis mecánicas, eléctricas y
+        anclajes libres en las estaciones cercanas. Datos abiertos (GBFS oficial, con respaldo automático
+        en Paris Open Data), no gasta cuota SNCF.
+        Da 'lugar' (nombre de estación Vélib, dirección o estación de tren) o coordenadas lat/lon.
+        :param lugar: P. ej. 'Glacière', 'Boulevard Arago', 'Gare d'Austerlitz'. Vacío si das lat/lon.
+        :param lat: Latitud (opcional si das lugar).
+        :param lon: Longitud (opcional si das lugar).
+        :param radio_m: Radio de búsqueda en metros.
+        :param max_estaciones: Máximo de estaciones a listar.
+        :param solo_electricas: True = solo estaciones con al menos una bici eléctrica disponible.
+        """
+        await self._status(__event_emitter__, "Consultando Vélib…")
+        try:
+            stations, source = await asyncio.to_thread(self._velib_load_sync)
+        except Exception as e:
+            await self._status(__event_emitter__, "Error Vélib", True)
+            return f"❌ Vélib no disponible ahora: {e}"
+        center, center_label = None, ""
+        if lat and lon:
+            center, center_label = (float(lat), float(lon)), f"({lat}, {lon})"
+        elif lugar:
+            q = _norm(lugar)
+            named = [s for s in stations if q in _norm(s["name"])]
+            if named:
+                center, center_label = (named[0]["lat"], named[0]["lon"]), f"estación Vélib '{named[0]['name']}'"
+            else:  # geocodificar con la API SNCF (direcciones, POI, estaciones) — 1 petición
+                data = await self._get("places", [("q", lugar), ("type[]", "address"), ("type[]", "stop_area"),
+                                                  ("type[]", "poi"), ("disable_geojson", "true")])
+                for p in data.get("places") or []:
+                    obj = p.get(p.get("embedded_type", ""), {}) or {}
+                    c = obj.get("coord") or {}
+                    if c.get("lat"):
+                        center, center_label = (float(c["lat"]), float(c["lon"])), p.get("name", lugar)
+                        break
+        await self._status(__event_emitter__, "Listo", True)
+        if not center:
+            return f"No pude ubicar '{lugar}'. Prueba con el nombre de una estación Vélib o con lat/lon."
+        rows = []
+        for s in stations:
+            d = self._haversine_m(center[0], center[1], s["lat"], s["lon"])
+            if d <= radio_m and not (solo_electricas and s["ebike"] == 0):
+                rows.append((d, s))
+        if not rows:
+            return f"No hay estaciones Vélib a menos de {radio_m} m de {center_label} con esos filtros."
+        rows.sort(key=lambda r: r[0])
+        now_ts = _now().timestamp()
+        out = [f"Vélib cerca de {center_label} (radio {radio_m} m, tiempo real · fuente: {source}):"]
+        for d, s in rows[: int(max_estaciones)]:
+            age_txt = f", act. hace {int((now_ts - s['ts']) // 60)} min" if s["ts"] else ""
+            out.append(f"- **{s['name']}** ({int(d)} m): 🚲 {s['mech']} mecánicas · ⚡ {s['ebike']} eléctricas · "
+                       f"🅿️ {s['docks']} anclajes libres" + ("" if s["ok"] else " · ⛔ fuera de servicio") + age_txt)
+        return "\n".join(out)
+
+    # ───────────── 9. cuota ─────────────
+    async def cuota_api(self) -> str:
+        """
+        Cuántas peticiones a la API SNCF ha hecho esta tool hoy (contador local, se reinicia al
+        reiniciar Open WebUI) frente al límite gratuito de 5000/día.
+        """
+        if self._quota_day != _now().date():
+            return "0 peticiones hoy (o el contador se reinició)."
+        return (f"{self._quota_used} peticiones hoy · freno local {self.valves.MAX_REQUESTS_PER_DAY} · "
+                "límite oficial 5000/día, 150 000/mes.")
